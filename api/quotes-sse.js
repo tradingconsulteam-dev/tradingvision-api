@@ -1,66 +1,68 @@
 // /api/quotes-sse.js
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 module.exports = async (req, res) => {
-  const token = process.env.FINNHUB;
+  const finnhub = process.env.FINNHUB;
+  const twelvedata = process.env.TWELVEDATA || "";
+
   const symbols = String(req.query.symbols || "AAPL,MSFT,OANDA:EUR_USD,BINANCE:BTCUSDT")
     .split(",").map(s => s.trim()).slice(0, 8);
 
-  // SSE headers
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Content-Type","text/event-stream");
+  res.setHeader("Cache-Control","no-cache, no-transform");
+  res.setHeader("Connection","keep-alive");
   res.flushHeaders && res.flushHeaders();
 
   let active = true;
-  req.on("close", () => { active = false; });
+  req.on("close", ()=> { active = false; });
 
   const fetchJson = async (url) => {
     const r = await fetch(url);
-    if (!r.ok) throw new Error("fetch failed");
+    if (!r.ok) throw new Error(`fetch ${r.status}`);
     return r.json();
   };
 
-  async function getLast(symbol) {
-    try {
-      // Forex / Crypto: prendi l'ultima candle (1m) come last
-      if (symbol.includes(":")) {
-        const now = Math.floor(Date.now() / 1000);
-        const from = now - 60 * 60; // 1h di margine
-        const endpoint = symbol.startsWith("OANDA:") ? "forex/candle" : "crypto/candle";
-        const url = `https://finnhub.io/api/v1/${endpoint}?symbol=${encodeURIComponent(symbol)}&resolution=1&from=${from}&to=${now}&token=${token}`;
-        const j = await fetchJson(url);
-        if (j && j.s === "ok" && Array.isArray(j.c) && j.c.length) {
-          const idx = j.c.length - 1;
-          return { symbol, last: j.c[idx], ts: (j.t && j.t[idx] ? j.t[idx]*1000 : Date.now()) };
-        }
-        // fallback
-        return { symbol, last: null, ts: Date.now() };
-      }
+  async function lastStock(sym){
+    const q = await fetchJson(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}&token=${finnhub}`);
+    return { symbol: sym, last: q.c ?? null, ts: Date.now() };
+  }
+  async function lastCrypto(sym){
+    const base = sym.split(":")[1] || sym;
+    const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${encodeURIComponent(base)}`);
+    if (!r.ok) throw new Error("binance");
+    const j = await r.json();
+    return { symbol: sym, last: parseFloat(j.price), ts: Date.now() };
+  }
+  async function lastForex(sym){
+    if (!twelvedata) throw new Error("twelvedata-missing");
+    const base = sym.split(":")[1]?.replace("_","/") || sym.replace("_","/");
+    // usa time_series con 1 ultimo punto (1min)
+    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(base)}&interval=1min&outputsize=1&apikey=${twelvedata}`;
+    const j = await fetchJson(url);
+    const v = (j.values && j.values[0]) ? parseFloat(j.values[0].close) : null;
+    return { symbol: sym, last: v, ts: Date.now() };
+  }
 
-      // Stocks: usa /quote
-      const q = await fetchJson(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${token}`);
-      return {
-        symbol,
-        last: q.c ?? null,
-        high: q.h ?? null,
-        low: q.l ?? null,
-        prevClose: q.pc ?? null,
-        ts: Date.now()
-      };
+  async function getLast(sym){
+    try {
+      if (!sym.includes(":")) return await lastStock(sym);
+      if (sym.startsWith("OANDA:")) return await lastForex(sym);
+      if (sym.startsWith("BINANCE:")) return await lastCrypto(sym);
+      // fallback generico → crypto
+      return await lastCrypto(sym);
     } catch {
-      return { symbol, last: null, ts: Date.now() };
+      return { symbol: sym, last: null, ts: Date.now() };
     }
   }
 
   while (active) {
     try {
-      const quotes = await Promise.all(symbols.map(getLast));
-      res.write(`data: ${JSON.stringify({ type: "quotes", payload: quotes })}\n\n`);
+      const payload = await Promise.all(symbols.map(getLast));
+      res.write(`data: ${JSON.stringify({ type: "quotes", payload })}\n\n`);
     } catch {
       res.write(`data: ${JSON.stringify({ type: "error", message: "fetch-failed" })}\n\n`);
     }
-    await sleep(3000); // rispetta rate-limit free
+    await sleep(3000);
   }
   res.end();
 };
